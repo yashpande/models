@@ -29,8 +29,21 @@ from object_detection.metrics import coco_evaluation
 from object_detection.utils import label_map_util
 from object_detection.utils import ops
 from object_detection.utils import visualization_utils as vis_utils
+from object_detection.utils import object_detection_evaluation
 
 slim = tf.contrib.slim
+
+# A dictionary of metric names to classes that implement the metric. The classes
+# in the dictionary must implement
+# utils.object_detection_evaluation.DetectionEvaluator interface.
+EVAL_METRICS_CLASS_DICT = {
+    'coco_detection_metrics':
+        coco_evaluation.CocoDetectionEvaluator,
+    'coco_mask_metrics':
+        coco_evaluation.CocoMaskEvaluator,
+}
+
+EVAL_DEFAULT_METRIC = 'coco_detection_metrics'
 
 
 def write_metrics(metrics, global_step, summary_dir):
@@ -42,6 +55,7 @@ def write_metrics(metrics, global_step, summary_dir):
     summary_dir: Directory to write tensorflow summaries to.
   """
   logging.info('Writing metrics to tf summary.')
+  print("Writing metrics to", summary_dir)
   summary_writer = tf.summary.FileWriterCache.get(summary_dir)
   for key in sorted(metrics):
     summary = tf.Summary(value=[
@@ -51,6 +65,116 @@ def write_metrics(metrics, global_step, summary_dir):
     logging.info('%s: %f', key, metrics[key])
   logging.info('Metrics written to tf summary.')
 
+def evaluate_detection_results_pascal_voc(result_lists,
+                                          categories,
+                                          label_id_offset=0,
+                                          iou_thres=0.5,
+                                          corloc_summary=False):
+  """Computes Pascal VOC detection metrics given groundtruth and detections.
+
+  This function computes Pascal VOC metrics. This function by default
+  takes detections and groundtruth boxes encoded in result_lists and writes
+  evaluation results to tf summaries which can be viewed on tensorboard.
+
+  Args:
+    result_lists: a dictionary holding lists of groundtruth and detection
+      data corresponding to each image being evaluated.  The following keys
+      are required:
+        'image_id': a list of string ids
+        'detection_boxes': a list of float32 numpy arrays of shape [N, 4]
+        'detection_scores': a list of float32 numpy arrays of shape [N]
+        'detection_classes': a list of int32 numpy arrays of shape [N]
+        'groundtruth_boxes': a list of float32 numpy arrays of shape [M, 4]
+        'groundtruth_classes': a list of int32 numpy arrays of shape [M]
+      and the remaining fields below are optional:
+        'difficult': a list of boolean arrays of shape [M] indicating the
+          difficulty of groundtruth boxes. Some datasets like PASCAL VOC provide
+          this information and it is used to remove difficult examples from eval
+          in order to not penalize the models on them.
+      Note that it is okay to have additional fields in result_lists --- they
+      are simply ignored.
+    categories: a list of dictionaries representing all possible categories.
+      Each dict in this list has the following keys:
+          'id': (required) an integer id uniquely identifying this category
+          'name': (required) string representing category name
+            e.g., 'cat', 'dog', 'pizza'
+    label_id_offset: an integer offset for the label space.
+    iou_thres: float determining the IoU threshold at which a box is considered
+        correct. Defaults to the standard 0.5.
+    corloc_summary: boolean. If True, also outputs CorLoc metrics.
+
+  Returns:
+    A dictionary of metric names to scalar values.
+
+  Raises:
+    ValueError: if the set of keys in result_lists is not a superset of the
+      expected list of keys.  Unexpected keys are ignored.
+    ValueError: if the lists in result_lists have inconsistent sizes.
+  """
+  # check for expected keys in result_lists
+  expected_keys = [
+      'detection_boxes', 'detection_scores', 'detection_classes', 'image_id'
+  ]
+  expected_keys += ['groundtruth_boxes', 'groundtruth_classes']
+  if not set(expected_keys).issubset(set(result_lists.keys())):
+    raise ValueError('result_lists does not have expected key set.')
+  num_results = len(result_lists[expected_keys[0]])
+  for key in expected_keys:
+    if len(result_lists[key]) != num_results:
+      raise ValueError('Inconsistent list sizes in result_lists')
+
+  # Pascal VOC evaluator assumes foreground index starts from zero.
+  categories = copy.deepcopy(categories)
+  for idx in range(len(categories)):
+    categories[idx]['id'] -= label_id_offset
+
+  # num_classes (maybe encoded as categories)
+  num_classes = max([cat['id'] for cat in categories]) + 1
+  logging.info('Computing Pascal VOC metrics on results.')
+  if all(image_id.isdigit() for image_id in result_lists['image_id']):
+    image_ids = [int(image_id) for image_id in result_lists['image_id']]
+  else:
+    image_ids = range(num_results)
+
+  evaluator = object_detection_evaluation.ObjectDetectionEvaluation(
+      num_classes, matching_iou_threshold=iou_thres)
+
+  difficult_lists = None
+  if 'difficult' in result_lists and result_lists['difficult']:
+    difficult_lists = result_lists['difficult']
+  for idx, image_id in enumerate(image_ids):
+    difficult = None
+    if difficult_lists is not None and difficult_lists[idx].size:
+      difficult = difficult_lists[idx].astype(np.bool)
+    evaluator.add_single_ground_truth_image_info(
+        image_id, result_lists['groundtruth_boxes'][idx],
+        result_lists['groundtruth_classes'][idx] - label_id_offset,
+        difficult)
+    evaluator.add_single_detected_image_info(
+        image_id, result_lists['detection_boxes'][idx],
+        result_lists['detection_scores'][idx],
+        result_lists['detection_classes'][idx] - label_id_offset)
+  per_class_ap, mean_ap, _, _, per_class_corloc, mean_corloc = (
+      evaluator.evaluate())
+
+  metrics = {'Precision/mAP@{}IOU'.format(iou_thres): mean_ap}
+  print('print Precision/mAP@{0}IOU = {1}. Eval on {2} images'.format(iou_thres, mean_ap, len(image_ids)))
+  category_index = label_map_util.create_category_index(categories)
+  for idx in range(per_class_ap.size):
+    if idx in category_index:
+      display_name = ('PerformanceByCategory/mAP@{}IOU/{}'
+                      .format(iou_thres, category_index[idx]['name']))
+      metrics[display_name] = per_class_ap[idx]
+
+  if corloc_summary:
+    metrics['CorLoc/CorLoc@{}IOU'.format(iou_thres)] = mean_corloc
+    for idx in range(per_class_corloc.size):
+      if idx in category_index:
+        display_name = (
+            'PerformanceByCategory/CorLoc@{}IOU/{}'.format(
+                iou_thres, category_index[idx]['name']))
+        metrics[display_name] = per_class_corloc[idx]
+  return metrics
 
 # TODO(rathodv): Add tests.
 def visualize_detection_results(result_dict,
@@ -68,12 +192,10 @@ def visualize_detection_results(result_dict,
                                 skip_labels=False,
                                 keep_image_id_for_visualization_export=False):
   """Visualizes detection results and writes visualizations to image summaries.
-
   This function visualizes an image with its detected bounding boxes and writes
   to image summaries which can be viewed on tensorboard.  It optionally also
   writes images to a directory. In the case of missing entry in the label map,
   unknown class name in the visualization is shown as "N/A".
-
   Args:
     result_dict: a dictionary holding groundtruth and detection
       data corresponding to each image being evaluated.  The following keys
@@ -408,12 +530,18 @@ def repeated_checkpoint_run(tensor_dict,
     logging.info('Starting evaluation at ' + time.strftime(
         '%Y-%m-%d-%H:%M:%S', time.gmtime()))
     model_path = tf.train.latest_checkpoint(checkpoint_dirs[0])
+    print("Checkpoint Dirs", checkpoint_dirs[0])
+    print("Model Path", model_path)
     if not model_path:
+      print("Not Model Path")
       logging.info('No model found in %s. Will try again in %d seconds',
                    checkpoint_dirs[0], eval_interval_secs)
     elif model_path == last_evaluated_model_path:
+      print("Last Eval. Model Path", last_evaluated_model_path)
+      print("Already evaluated")
       logging.info('Found already evaluated checkpoint. Will try again in %d '
                    'seconds', eval_interval_secs)
+      break
     else:
       last_evaluated_model_path = model_path
       global_step, metrics = _run_checkpoint_once(tensor_dict, evaluators,
@@ -425,6 +553,8 @@ def repeated_checkpoint_run(tensor_dict,
                                                   save_graph_dir,
                                                   losses_dict=losses_dict)
       write_metrics(metrics, global_step, summary_dir)
+      print("Writing Metrics for", model_path)
+      print("Writing Metrics To", summary_dir)
     number_of_evaluations += 1
 
     if (max_number_of_evaluations and
@@ -432,8 +562,6 @@ def repeated_checkpoint_run(tensor_dict,
       logging.info('Finished evaluation!')
       break
     time_to_next_eval = start + eval_interval_secs - time.time()
-    if time_to_next_eval > 0:
-      time.sleep(time_to_next_eval)
 
   return metrics
 
@@ -582,70 +710,89 @@ def result_dict_for_single_example(image,
   return output_dict
 
 
-def get_eval_metric_ops_for_evaluators(evaluation_metrics,
-                                       categories,
-                                       eval_dict,
-                                       include_metrics_per_category=False):
-  """Returns a dictionary of eval metric ops to use with `tf.EstimatorSpec`.
+def get_evaluators(eval_config, categories, evaluator_options=None):
+  """Returns the evaluator class according to eval_config, valid for categories.
 
   Args:
-    evaluation_metrics: List of evaluation metric names. Current options are
-      'coco_detection_metrics' and 'coco_mask_metrics'.
+    eval_config: An `eval_pb2.EvalConfig`.
+    categories: A list of dicts, each of which has the following keys -
+        'id': (required) an integer id uniquely identifying this category.
+        'name': (required) string representing category name e.g., 'cat', 'dog'.
+    evaluator_options: A dictionary of metric names (see
+      EVAL_METRICS_CLASS_DICT) to `DetectionEvaluator` initialization
+      keyword arguments. For example:
+      evalator_options = {
+        'coco_detection_metrics': {'include_metrics_per_category': True}
+      }
+
+  Returns:
+    An list of instances of DetectionEvaluator.
+
+  Raises:
+    ValueError: if metric is not in the metric class dictionary.
+  """
+  evaluator_options = evaluator_options or {}
+  eval_metric_fn_keys = eval_config.metrics_set
+  if not eval_metric_fn_keys:
+    eval_metric_fn_keys = [EVAL_DEFAULT_METRIC]
+  evaluators_list = []
+  for eval_metric_fn_key in eval_metric_fn_keys:
+    if eval_metric_fn_key not in EVAL_METRICS_CLASS_DICT:
+      raise ValueError('Metric not found: {}'.format(eval_metric_fn_key))
+    kwargs_dict = (evaluator_options[eval_metric_fn_key] if eval_metric_fn_key
+                   in evaluator_options else {})
+    evaluators_list.append(EVAL_METRICS_CLASS_DICT[eval_metric_fn_key](
+        categories,
+        **kwargs_dict))
+  return evaluators_list
+
+
+def get_eval_metric_ops_for_evaluators(eval_config,
+                                       categories,
+                                       eval_dict):
+  """Returns eval metrics ops to use with `tf.estimator.EstimatorSpec`.
+
+  Args:
+    eval_config: An `eval_pb2.EvalConfig`.
     categories: A list of dicts, each of which has the following keys -
         'id': (required) an integer id uniquely identifying this category.
         'name': (required) string representing category name e.g., 'cat', 'dog'.
     eval_dict: An evaluation dictionary, returned from
       result_dict_for_single_example().
-    include_metrics_per_category: If True, additionally include per-category
-      metrics.
 
   Returns:
     A dictionary of metric names to tuple of value_op and update_op that can be
     used as eval metric ops in tf.EstimatorSpec.
-
-  Raises:
-    ValueError: If any of the metrics in `evaluation_metric` is not
-    'coco_detection_metrics' or 'coco_mask_metrics'.
   """
-  evaluation_metrics = list(set(evaluation_metrics))
-
-  input_data_fields = fields.InputDataFields
-  detection_fields = fields.DetectionResultFields
   eval_metric_ops = {}
-  for metric in evaluation_metrics:
-    if metric == 'coco_detection_metrics':
-      coco_evaluator = coco_evaluation.CocoDetectionEvaluator(
-          categories, include_metrics_per_category=include_metrics_per_category)
-      eval_metric_ops.update(
-          coco_evaluator.get_estimator_eval_metric_ops(
-              image_id=eval_dict[input_data_fields.key],
-              groundtruth_boxes=eval_dict[input_data_fields.groundtruth_boxes],
-              groundtruth_classes=eval_dict[
-                  input_data_fields.groundtruth_classes],
-              detection_boxes=eval_dict[detection_fields.detection_boxes],
-              detection_scores=eval_dict[detection_fields.detection_scores],
-              detection_classes=eval_dict[detection_fields.detection_classes],
-              groundtruth_is_crowd=eval_dict.get(
-                  input_data_fields.groundtruth_is_crowd)))
-    elif metric == 'coco_mask_metrics':
-      coco_mask_evaluator = coco_evaluation.CocoMaskEvaluator(
-          categories, include_metrics_per_category=include_metrics_per_category)
-      eval_metric_ops.update(
-          coco_mask_evaluator.get_estimator_eval_metric_ops(
-              image_id=eval_dict[input_data_fields.key],
-              groundtruth_boxes=eval_dict[input_data_fields.groundtruth_boxes],
-              groundtruth_classes=eval_dict[
-                  input_data_fields.groundtruth_classes],
-              groundtruth_instance_masks=eval_dict[
-                  input_data_fields.groundtruth_instance_masks],
-              detection_scores=eval_dict[detection_fields.detection_scores],
-              detection_classes=eval_dict[detection_fields.detection_classes],
-              detection_masks=eval_dict[detection_fields.detection_masks],
-              groundtruth_is_crowd=eval_dict.get(
-                  input_data_fields.groundtruth_is_crowd),))
-    else:
-      raise ValueError('The only evaluation metrics supported are '
-                       '"coco_detection_metrics" and "coco_mask_metrics". '
-                       'Found {} in the evaluation metrics'.format(metric))
-
+  evaluator_options = evaluator_options_from_eval_config(eval_config)
+  evaluators_list = get_evaluators(eval_config, categories, evaluator_options)
+  for evaluator in evaluators_list:
+    eval_metric_ops.update(evaluator.get_estimator_eval_metric_ops(
+        eval_dict))
   return eval_metric_ops
+
+
+def evaluator_options_from_eval_config(eval_config):
+  """Produces a dictionary of evaluation options for each eval metric.
+
+  Args:
+    eval_config: An `eval_pb2.EvalConfig`.
+
+  Returns:
+    evaluator_options: A dictionary of metric names (see
+      EVAL_METRICS_CLASS_DICT) to `DetectionEvaluator` initialization
+      keyword arguments. For example:
+      evalator_options = {
+        'coco_detection_metrics': {'include_metrics_per_category': True}
+      }
+  """
+  eval_metric_fn_keys = eval_config.metrics_set
+  evaluator_options = {}
+  for eval_metric_fn_key in eval_metric_fn_keys:
+    if eval_metric_fn_key in ('coco_detection_metrics', 'coco_mask_metrics'):
+      evaluator_options[eval_metric_fn_key] = {
+          'include_metrics_per_category': (
+              eval_config.include_metrics_per_category)
+      }
+  return evaluator_options
